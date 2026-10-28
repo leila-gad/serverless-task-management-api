@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Serverless REST API (Task Management) - API Gateway + Cognito authorizer + Lambda + DynamoDB,
+  protected by AWS WAF and observed with CloudWatch and X-Ray.
+
+Parameters:
+  RateLimit:
+    Type: Number
+    Default: 100
+    MinValue: 10
+    Description: Max requests per 5 minutes per IP before WAF blocks it (rate-based rule).
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Optional. Email address that receives CloudWatch alarm notifications via SNS.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 10
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref TodosTable
+
+Resources:
+  # ---------------------------------------------------------------- Data layer
+  TodosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: todoId, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: todoId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: StatusIndex
+          KeySchema:
+            - { AttributeName: userId, KeyType: HASH }
+            - { AttributeName: status, KeyType: RANGE }
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # ------------------------------------------------------------- Authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${AWS::StackName}-client'
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # ----------------------------------------------------------------- API + Lambda
+  TodosApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      TracingEnabled: true
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          MetricsEnabled: true
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+
+  TodosFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-todos'
+      CodeUri: src/
+      Handler: handler.lambda_handler
+      Description: CRUD handler for the tasks API
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref TodosTable
+      Events:
+        CreateTodo:
+          Type: Api
+          Properties: { RestApiId: !Ref TodosApi, Path: /todos, Method: post }
+        ListTodos:
+          Type: Api
+          Properties: { RestApiId: !Ref TodosApi, Path: /todos, Method: get }
+        GetTodo:
+          Type: Api
+          Properties: { RestApiId: !Ref TodosApi, Path: '/todos/{id}', Method: get }
+        UpdateTodo:
+          Type: Api
+          Properties: { RestApiId: !Ref TodosApi, Path: '/todos/{id}', Method: put }
+        DeleteTodo:
+          Type: Api
+          Properties: { RestApiId: !Ref TodosApi, Path: '/todos/{id}', Method: delete }
+
+  # -------------------------------------------------------------------------- WAF
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${AWS::StackName}-web-acl'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${AWS::StackName}-web-acl'
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: RateLimitPerIP
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref RateLimit
+              AggregateKeyType: IP
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIP
+            SampledRequestsEnabled: true
+        - Name: AWSManagedCommonRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedCommonRuleSet
+            SampledRequestsEnabled: true
+
+  WebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: TodosApiprodStage
+    Properties:
+      ResourceArn: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${TodosApi}/stages/prod'
+      WebACLArn: !GetAtt WebACL.Arn
+
+  # ----------------------------------------------------------------- Observability
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: Todo API alerts
+
+  AlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Lambda reported errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - { Name: FunctionName, Value: !Ref TodosFunction }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  Api5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: API Gateway returned 5XX errors
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - { Name: ApiName, Value: !Sub '${AWS::StackName}' }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertTopic]
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{
+              "title":"API requests, 4XX and 5XX","region":"${AWS::Region}","stat":"Sum","period":60,
+              "metrics":[["AWS/ApiGateway","Count","ApiName","${AWS::StackName}","Stage","prod"],
+                         [".","4XXError",".",".",".","."],
+                         [".","5XXError",".",".",".","."]]}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{
+              "title":"API latency (ms)","region":"${AWS::Region}","stat":"Average","period":60,
+              "metrics":[["AWS/ApiGateway","Latency","ApiName","${AWS::StackName}","Stage","prod"],
+                         [".","IntegrationLatency",".",".",".","."]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{
+              "title":"Lambda invocations, errors, throttles","region":"${AWS::Region}","stat":"Sum","period":60,
+              "metrics":[["AWS/Lambda","Invocations","FunctionName","${TodosFunction}"],
+                         [".","Errors",".","."],
+                         [".","Throttles",".","."]]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{
+              "title":"WAF allowed vs blocked","region":"${AWS::Region}","stat":"Sum","period":60,
+              "metrics":[["AWS/WAFV2","AllowedRequests","WebACL","${AWS::StackName}-web-acl","Region","${AWS::Region}","Rule","ALL"],
+                         [".","BlockedRequests",".",".",".",".",".","."]]}}
+          ]
+        }
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the REST API 
+    Value: !Sub 'https://${TodosApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  TableName:
+    Value: !Ref TodosTable
+  FunctionName:
+    Value: !Ref TodosFunction
+  DashboardName:
+    Value: !Sub '${AWS::StackName}-dashboard'
