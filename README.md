@@ -7,7 +7,6 @@ A secure, fully serverless REST API for task management. Users sign in with **Am
 
 ![Architecture](docs/architecture.png)
 
-What is deployed by this repository (CloudFront is optional in the diagram and is not deployed here)
 
 
 ### Request flow
