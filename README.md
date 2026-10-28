@@ -9,22 +9,6 @@ A secure, fully serverless REST API for task management. Users sign in with **Am
 
 What is deployed by this repository (CloudFront is optional in the diagram and is not deployed here)
 
-```mermaid
-flowchart LR
-    U([Application user]) -- "1. Sign in / register" --> C[Amazon Cognito<br/>User Pool]
-    C -- "2. JWT tokens" --> U
-    U -- "3. HTTPS + JWT" --> W[AWS WAF<br/>rate limit + OWASP rules]
-    W --> A[API Gateway<br/>REST API, prod stage]
-    A -. "4. validate token<br/>(Cognito authorizer)" .-> C
-    A -- "5. invoke" --> L[AWS Lambda<br/>Python 3.12]
-    L -- "6. read / write" --> D[(DynamoDB<br/>Todos table)]
-    A -. metrics .-> CW[CloudWatch<br/>dashboard + alarms]
-    L -. logs .-> CW
-    CW -. alarm .-> SNS[SNS topic<br/>email alerts]
-    A -. traces .-> X[AWS X-Ray]
-    L -. traces .-> X
-    D -. traces .-> X
-```
 
 ### Request flow
 1. The user signs up / signs in with Cognito and receives JWT tokens.
